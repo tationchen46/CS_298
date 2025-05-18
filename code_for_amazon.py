@@ -515,7 +515,7 @@ if __name__ == "__main__":
     seq_len       = 10
     dropout_rate  = 0.3
     batch_size    = 64    # reduced to fit memory
-    epochs        = 30
+    epochs        = 100
     lr            = 1e-3
 
     train_ds = TrainDataset(train_inter, seq_len, n_items, neg=10)
