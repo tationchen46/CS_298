@@ -185,9 +185,23 @@ data.adj_list = adj_list
 data.n_id = torch.arange(n_total_nodes).unsqueeze(1)
 
 #############################################
+# 5b. Prepare a separate Data object for clustering  
+#     (only user–item edges)
+#############################################
+cluster_data_obj = Data(
+    edge_index=edge_index_ui,    # <-- only UI edges here
+    edge_attr=edge_attr_ui,
+    num_nodes=n_total_nodes
+)
+# move clustering to CPU
+cluster_data_obj = cluster_data_obj.cpu()
+
+#############################################
 # 6. Cluster-GCN Preparation
 #############################################
-cluster_data = ClusterData(data, num_parts=50, recursive=False)
+# Partition **only** the user–item graph
+cluster_data = ClusterData(cluster_data_obj, num_parts=50, recursive=False)
+# Build the cluster_assignment tensor
 cluster_list = list(cluster_data)
 cluster_assignment = torch.empty(n_total_nodes, dtype=torch.long)
 for cluster_idx, cluster in enumerate(cluster_list):
