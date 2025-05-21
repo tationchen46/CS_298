@@ -188,25 +188,36 @@ data.n_id = torch.arange(n_total_nodes).unsqueeze(1)
 # 5b. Prepare a separate Data object for clustering  
 #     (only user–item edges)
 #############################################
+# 1) Total number of nodes
+n_total_nodes=n_users+n_movies
 cluster_data_obj = Data(
     edge_index=edge_index_ui,    # <-- only UI edges here
     edge_attr=edge_attr_ui,
     num_nodes=n_total_nodes
-)
+).cpu()
 # move clustering to CPU
-cluster_data_obj = cluster_data_obj.cpu()
+#cluster_data_obj = cluster_data_obj.cpu()
 
 #############################################
 # 6. Cluster-GCN Preparation
 #############################################
 # Partition **only** the user–item graph
 cluster_data = ClusterData(cluster_data_obj, num_parts=50, recursive=False)
-# Build the cluster_assignment tensor
-cluster_list = list(cluster_data)
+
+# Prepare the assignment tensor
 cluster_assignment = torch.empty(n_total_nodes, dtype=torch.long)
-for cluster_idx, cluster in enumerate(cluster_list):
-    cluster_assignment[cluster.n_id] = cluster_idx
-cluster_assignment = cluster_assignment.to(device)
+# Extract `partptr` and `node_perm` from the partition object
+#    (these live under `cluster_data.partition` when you import from torch_geometric.loader) 
+partptr    = cluster_data.partition.partptr      # shape [num_parts+1]
+node_perm  = cluster_data.partition.node_perm    # shape [num_nodes]
+
+#For each cluster c, the nodes with global IDs node_perm[ partptr[c] : partptr[c+1] ]
+#    belong to cluster c
+for c in range(len(cluster_data)):
+    start = int(partptr[c])
+    end   = int(partptr[c + 1])
+    node_ids = node_perm[start:end]               # Tensor of global node IDs
+    cluster_assignment[node_ids] = c
 
 #############################################
 # 7. Prepare Chronologically Ordered User Interaction Sequences
@@ -324,9 +335,10 @@ class ClusterGCNLayer(nn.Module):
     def __init__(self, in_channels, out_channels, cluster_assignment, full_edge_index, full_edge_attr):
         super(ClusterGCNLayer, self).__init__()
         self.conv = GCNConv(in_channels, out_channels)
-        self.cluster_assignment = cluster_assignment  # Tensor of shape (num_nodes,)
-        self.full_edge_index = full_edge_index
-        self.full_edge_attr = full_edge_attr  # Not used by GCNConv.
+        # register all three as buffers:
+        self.register_buffer('cluster_assignment', cluster_assignment)
+        self.register_buffer('full_edge_index',    full_edge_index)
+        self.register_buffer('full_edge_attr',     full_edge_attr)
     def forward(self, X):
         X_updated = X.clone()
         unique_clusters = torch.unique(self.cluster_assignment)
@@ -393,7 +405,8 @@ class EnrichedGATModule(nn.Module):
         # Save full graph info.
         self.register_buffer('full_edge_index', full_edge_index)
         self.register_buffer('full_edge_attr', full_edge_attr)
-        self.cluster_assignment = cluster_assignment  # Tensor of shape (num_nodes,)
+        self.register_buffer('cluster_assignment', cluster_assignment)
+        #self.cluster_assignment = cluster_assignment  # Tensor of shape (num_nodes,)
         
         # Dedicated Cluster-GCN layer.
         if cluster_assignment is not None and full_edge_index is not None:
@@ -544,7 +557,13 @@ def train_model(model, train_loader, val_loader, epochs=50, lr=0.001, product_ex
         total_train_samples = 0
         if USE_GAT_CACHING:
             with torch.no_grad():
-                cached_user_embeds, cached_item_embeds = model.graph_module(product_extra_features)
+                # run graph_module on CPU
+                cpu_model = model.cpu()
+                cpu_feats = product_extra_features.cpu()
+                u_cpu, i_cpu = cpu_model.graph_module(cpu_feats)
+                cached_user_embeds = u_cpu.to(device)
+                cached_item_embeds = i_cpu.to(device)
+                model.to(device)
         for batch_idx, (user_ids, input_seqs, pos_items, neg_items, pos_labels) in enumerate(train_loader):
             user_ids = user_ids.to(device)
             input_seqs = input_seqs.to(device)
@@ -680,9 +699,9 @@ def evaluate_model_batch(model, test_loader, n_items, k=10, chunk_size=1000, pro
                     pos_idx = predicted_items.index(true_item)
                     ndcg = 1.0 / torch.log2(torch.tensor(pos_idx + 2, dtype=torch.float)).item()
                 total_precision += prec
-                total_recall += 0.3 * rec
+                total_recall += rec
                 total_ndcg += ndcg
-            total_samples += 0.2 * B
+            total_samples += B
     avg_precision = total_precision / total_samples
     avg_recall = total_recall / total_samples
     avg_ndcg = total_ndcg / total_samples
@@ -713,9 +732,9 @@ train_dataset = TrainDataset(train_sequences, seq_len, n_movies, neg_pool_size=1
 val_dataset = TrainDataset(train_sequences, seq_len, n_movies, neg_pool_size=10)
 test_dataset = TestDataset(test_sequences, seq_len)
 
-train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True, collate_fn=collate_train, num_workers=2, pin_memory=True)
-val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False, collate_fn=collate_train, num_workers=2, pin_memory=True)
-test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False, collate_fn=collate_test, num_workers=2, pin_memory=True)
+train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True, collate_fn=collate_train, num_workers=2, pin_memory=True)
+val_loader = DataLoader(val_dataset, batch_size=256, shuffle=False, collate_fn=collate_train, num_workers=2, pin_memory=True)
+test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False, collate_fn=collate_test, num_workers=2, pin_memory=True)
 
 model = CollaborativeGraphLSTM(
     n_users, n_movies, embedding_dim, extra_dim, num_heads, num_layers,
